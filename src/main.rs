@@ -40,10 +40,7 @@ impl Args {
         if metadata.is_file() {
             let full_path = root;
             let size = metadata.len();
-            accumulator
-                .entry(size)
-                .or_insert_with(Vec::new)
-                .push(full_path);
+            accumulator.entry(size).or_default().push(full_path);
         } else if metadata.is_dir() && recursive {
             let mut entries = fs::read_dir(root)?;
             while let Some(entry) = entries.next() {
@@ -55,15 +52,14 @@ impl Args {
     }
 }
 
-fn dedupe(hasher: &mut Hasher, files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
+fn dedupe(files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
     let mut file_by_hash = HashMap::new();
-    hasher.reset();
     for file in files {
+        let mut hasher = Hasher::new();
         let mut reader = BufReader::new(fs::File::open(&file)?);
-        copy(&mut reader, hasher)?;
+        copy(&mut reader, &mut hasher)?;
         let hash = hasher.finalize().to_hex().to_string();
         file_by_hash.entry(hash).or_insert_with(Vec::new).push(file);
-        hasher.reset();
     }
     for (_, files) in file_by_hash {
         if files.len() > 1 {
@@ -85,9 +81,8 @@ fn dedupe(hasher: &mut Hasher, files: Vec<PathBuf>, dry_run: bool) -> Result<()>
 fn main() -> Result<()> {
     let args = Args::parse();
     let files = args.files()?;
-    let mut hasher = Hasher::new();
     for (_, files) in files {
-        dedupe(&mut hasher, files, args.dry_run)?;
+        dedupe(files, args.dry_run)?;
     }
     Ok(())
 }
