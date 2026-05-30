@@ -3,7 +3,7 @@ mod dedupe;
 mod hash;
 mod scan;
 
-use std::io::Result;
+use std::io::{Result, stderr, stdout};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -15,15 +15,17 @@ use cli::Args;
 use dedupe::dedupe;
 
 fn main() -> Result<()> {
-    let writer = std::io::stderr
-        .with_max_level(Level::WARN)
-        .or_else(std::io::stdout.with_max_level(Level::INFO));
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .with_writer(writer)
+        .with_writer(
+            stderr
+                .with_max_level(Level::WARN)
+                .or_else(stdout.with_max_level(Level::INFO)),
+        )
+        .without_time()
         .init();
 
     let args = Args::parse();
