@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
@@ -36,34 +36,69 @@ impl Args {
 
         let pairs = paths
             .into_par_iter()
-            .map(|root| Self::walk(root, self.recursive))
+            .map(|root| Self::walk(&root, self.recursive))
             .collect::<Result<Vec<_>>>()?;
 
+        // If user fucks up we can reach the same file in multiple ways.
+        let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut files: HashMap<u64, Vec<PathBuf>> = HashMap::new();
         for (size, path) in pairs.into_iter().flatten() {
-            files.entry(size).or_default().push(path);
+            if seen.insert(path.clone()) {
+                files.entry(size).or_default().push(path);
+            }
         }
         Ok(files)
     }
 
-    fn walk(root: PathBuf, recursive: bool) -> Result<Vec<(u64, PathBuf)>> {
-        let metadata = fs::metadata(&root)?;
-        if metadata.is_file() {
-            Ok(vec![(metadata.len(), root)])
-        } else if metadata.is_dir() && recursive {
-            let entries = fs::read_dir(root)?
-                .map(|entry| Ok(entry?.path()))
-                .collect::<Result<Vec<_>>>()?;
+    fn walk(root: &Path, recursive: bool) -> Result<Vec<(u64, PathBuf)>> {
+        let metadata = fs::symlink_metadata(root)?;
+        let file_type = metadata.file_type();
 
-            let nested = entries
-                .into_par_iter()
-                .map(|entry| Self::walk(entry, recursive))
-                .collect::<Result<Vec<_>>>()?;
-
-            Ok(nested.into_iter().flatten().collect())
-        } else {
-            Ok(Vec::new())
+        if file_type.is_symlink() {
+            return Ok(Vec::new());
         }
+        if file_type.is_file() {
+            return Ok(vec![(metadata.len(), root.to_path_buf())]);
+        }
+        if !file_type.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let entries = fs::read_dir(root)?
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry.path()),
+                Err(err) => {
+                    eprintln!("skipping unreadable entry in {}: {err}", root.display());
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let files = entries
+            .into_par_iter()
+            .map(|entry| {
+                let result = if recursive {
+                    Self::walk(&entry, recursive)
+                } else {
+                    fs::symlink_metadata(&entry).map(|metadata| {
+                        if metadata.file_type().is_file() {
+                            vec![(metadata.len(), entry.clone())]
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                };
+                result.unwrap_or_else(|error| {
+                    eprintln!("skipping {}: {error}", entry.display());
+                    Vec::new()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        Ok(files)
     }
 }
 
@@ -74,35 +109,55 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn dedupe(files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
-    let hashed = files
+fn dedupe(files: Vec<PathBuf>, dry_run: bool) {
+    let hashed: Vec<(String, PathBuf)> = files
         .into_par_iter()
-        .map(|file| Ok((hash_file(&file)?, file)))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|file| match hash_file(&file) {
+            Ok(hash) => Some((hash, file)),
+            Err(error) => {
+                eprintln!("skipping {}: {error}", file.display());
+                None
+            }
+        })
+        .collect();
 
     let mut file_by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for (hash, file) in hashed {
         file_by_hash.entry(hash).or_default().push(file);
     }
-    for (_, files) in file_by_hash {
-        if files.len() > 1 {
-            let (head, tail) = files.split_first().expect("non empty files");
-            println!("Found {} duplicates of {head:?}", tail.len());
-            for file in tail {
-                if dry_run {
-                    println!("Would remove {file:?}");
-                } else {
-                    fs::remove_file(file)?;
-                    println!("Removed {file:?}");
-                }
+
+    for (_, mut group) in file_by_hash {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort();
+        let (head, duplicates) = group.split_first().expect("non-empty group");
+        println!(
+            "Found {} duplicate(s) of {}",
+            duplicates.len(),
+            head.display()
+        );
+        for file in duplicates {
+            if file == head {
+                continue; // Just to be safe.
+            }
+            if dry_run {
+                println!("Would remove {}", file.display());
+            } else if let Err(error) = fs::remove_file(file) {
+                eprintln!("failed to remove {}: {error}", file.display());
+            } else {
+                println!("Removed {}", file.display());
             }
         }
     }
-    Ok(())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.threads == 0 {
+        eprintln!("number of threads must be positive");
+        std::process::exit(1);
+    }
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
@@ -113,6 +168,6 @@ fn main() -> Result<()> {
         .filter(|(_, files)| files.len() > 1)
         .flat_map(|(_, files)| files)
         .collect();
-    dedupe(candidates, args.dry_run)?;
+    dedupe(candidates, args.dry_run);
     Ok(())
 }
