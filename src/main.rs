@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use clap::*;
+use rayon::prelude::*;
 use std::fs;
 use std::io::{BufReader, Result, copy};
 
@@ -13,53 +14,75 @@ struct Args {
     dry_run: bool,
     #[arg(short, long, default_value_t = false)]
     recursive: bool,
+    #[arg(short, long, default_value_t = default_threads())]
+    threads: usize,
     #[arg(required = true)]
     roots: Vec<String>,
 }
 
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 impl Args {
     fn files(&self) -> Result<HashMap<u64, Vec<PathBuf>>> {
-        let mut files = HashMap::new();
         let paths = self
             .roots
             .iter()
             .map(|raw| fs::canonicalize(Path::new(raw)))
             .collect::<Result<Vec<_>>>()?;
-        for root in paths {
-            Self::walk(root, self.recursive, &mut files)?;
+
+        let pairs = paths
+            .into_par_iter()
+            .map(|root| Self::walk(root, self.recursive))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut files: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        for (size, path) in pairs.into_iter().flatten() {
+            files.entry(size).or_default().push(path);
         }
         Ok(files)
     }
 
-    fn walk(
-        root: PathBuf,
-        recursive: bool,
-        accumulator: &mut HashMap<u64, Vec<PathBuf>>,
-    ) -> Result<()> {
+    fn walk(root: PathBuf, recursive: bool) -> Result<Vec<(u64, PathBuf)>> {
         let metadata = fs::metadata(&root)?;
         if metadata.is_file() {
-            let full_path = root;
-            let size = metadata.len();
-            accumulator.entry(size).or_default().push(full_path);
+            Ok(vec![(metadata.len(), root)])
         } else if metadata.is_dir() && recursive {
-            let mut entries = fs::read_dir(root)?;
-            while let Some(entry) = entries.next() {
-                let entry = entry?.path();
-                Self::walk(entry, recursive, accumulator)?;
-            }
+            let entries = fs::read_dir(root)?
+                .map(|entry| Ok(entry?.path()))
+                .collect::<Result<Vec<_>>>()?;
+
+            let nested = entries
+                .into_par_iter()
+                .map(|entry| Self::walk(entry, recursive))
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(nested.into_iter().flatten().collect())
+        } else {
+            Ok(Vec::new())
         }
-        Ok(())
     }
 }
 
+fn hash_file(path: &Path) -> Result<String> {
+    let mut hasher = Hasher::new();
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    copy(&mut reader, &mut hasher)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn dedupe(files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
-    let mut file_by_hash = HashMap::new();
-    for file in files {
-        let mut hasher = Hasher::new();
-        let mut reader = BufReader::new(fs::File::open(&file)?);
-        copy(&mut reader, &mut hasher)?;
-        let hash = hasher.finalize().to_hex().to_string();
-        file_by_hash.entry(hash).or_insert_with(Vec::new).push(file);
+    let hashed = files
+        .into_par_iter()
+        .map(|file| Ok((hash_file(&file)?, file)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut file_by_hash: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for (hash, file) in hashed {
+        file_by_hash.entry(hash).or_default().push(file);
     }
     for (_, files) in file_by_hash {
         if files.len() > 1 {
@@ -80,9 +103,16 @@ fn dedupe(files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let files = args.files()?;
-    for (_, files) in files {
-        dedupe(files, args.dry_run)?;
-    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .expect("failed to configure thread pool");
+    let candidates: Vec<PathBuf> = args
+        .files()?
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .flat_map(|(_, files)| files)
+        .collect();
+    dedupe(candidates, args.dry_run)?;
     Ok(())
 }
