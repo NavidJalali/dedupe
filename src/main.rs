@@ -10,6 +10,8 @@ use std::io::{BufReader, Result, copy};
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long, default_value_t = false)]
+    dry_run: bool,
+    #[arg(short, long, default_value_t = false)]
     recursive: bool,
     #[arg(required = true)]
     roots: Vec<String>,
@@ -53,7 +55,7 @@ impl Args {
     }
 }
 
-fn dedupe(hasher: &mut Hasher, files: Vec<PathBuf>) -> Result<()> {
+fn dedupe(hasher: &mut Hasher, files: Vec<PathBuf>, dry_run: bool) -> Result<()> {
     let mut file_by_hash = HashMap::new();
     hasher.reset();
     for file in files {
@@ -66,10 +68,15 @@ fn dedupe(hasher: &mut Hasher, files: Vec<PathBuf>) -> Result<()> {
     for (_, files) in file_by_hash {
         if files.len() > 1 {
             let (head, tail) = files.split_first().expect("non empty files");
+            println!("Found {} duplicates of {head:?}", tail.len());
             for file in tail {
-                fs::remove_file(file)?;
+                if dry_run {
+                    println!("Would remove {file:?}");
+                } else {
+                    fs::remove_file(file)?;
+                    println!("Removed {file:?}");
+                }
             }
-            println!("Removed {} copies of {head:?}", tail.len());
         }
     }
     Ok(())
@@ -80,7 +87,7 @@ fn main() -> Result<()> {
     let files = args.files()?;
     let mut hasher = Hasher::new();
     for (_, files) in files {
-        dedupe(&mut hasher, files)?;
+        dedupe(&mut hasher, files, args.dry_run)?;
     }
     Ok(())
 }
